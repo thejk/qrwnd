@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=QRwnd
+Comment=Show QR code for URL in current primary selection
+Categories=Utility
+Exec=qrwnd
+Icon=org.the_jk.qrwnd
+StartupNotify=false
+StartupWMClass=org.the_jk.qrwnd
