@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
         cairo_set_source_rgb(cr.get(), 1.0, 1.0, 1.0);
         cairo_fill(cr.get());
       }
+      cairo_surface_flush(surface.get());
       flush = true;
     }
 
