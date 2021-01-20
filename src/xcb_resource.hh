@@ -80,7 +80,7 @@ shared_wnd make_shared_wnd(shared_conn conn);
 
 typedef std::unique_ptr<xcb_resource<xcb_gcontext_t,
                                      internal::GCDeleter>> unique_gc;
-typedef std::shared_ptr<xcb_resource<xcb_window_t,
+typedef std::shared_ptr<xcb_resource<xcb_gcontext_t,
                                      internal::GCDeleter>> shared_gc;
 
 unique_gc make_unique_gc(shared_conn conn);
