@@ -9,7 +9,7 @@ project('qrwnd', 'cpp',
 cpp_optional_flags = [
   '-fno-exceptions',
   '-fvisibility=hidden',
-  # Redefining explicit to be able to include xcb.h
+  # Redefining explicit to be able to include xkb.h
   '-Wno-keyword-macro',
 ]
 cpp_flags = [
