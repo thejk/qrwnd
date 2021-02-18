@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
         request_active = false;
         if (e->property) {
           auto cookie = xcb_get_property(
-              conn.get(), 0, e->requestor, e->property,
+              conn.get(), 1 /* delete */, e->requestor, e->property,
               XCB_GET_PROPERTY_TYPE_ANY,
               0, std::numeric_limits<uint32_t>::max() / 4);
           xcb_generic_error_t* err = nullptr;
@@ -356,8 +356,6 @@ int main(int argc, char** argv) {
               xcb_event_get_error_label(err->error_code) << std::endl;
             free(err);
           }
-
-          xcb_delete_property(conn.get(), wnd->id(), e->property);
         } else {
           // Target format not supported, try with STRING if using UTF8_STRING
           if (e->target == utf8_string.get()) {
