@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
   value_list[0] = screen->white_pixel;
   value_mask |= XCB_CW_EVENT_MASK;
   value_list[1] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
-    XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE;
   xcb_create_window(conn.get(), XCB_COPY_FROM_PARENT, wnd->id(), screen->root,
                     0, 0, wnd_width, wnd_height, 0,
                     XCB_WINDOW_CLASS_INPUT_OUTPUT,
@@ -203,10 +203,13 @@ int main(int argc, char** argv) {
   // a bad idea.
   bool request_active = false;
   bool request_queued = true;
+  xcb_window_t incr_requestor = XCB_NONE;
+  xcb_window_t incr_property = XCB_NONE;
   auto request_type = utf8_string.get();
 
   bool update_code = false;
   std::string current_data;
+  std::string incr_data;
   std::unique_ptr<cairo_surface_t, CairoSurfaceDeleter> current;
 
   bool invalidate = true;
@@ -351,7 +354,15 @@ int main(int argc, char** argv) {
                 update_code = true;
               }
             } else if (reply->type == incr.get()) {
-              // INCR not yet supported
+              incr_requestor = e->requestor;
+              incr_property = e->property;
+              auto len = xcb_get_property_value_length(reply.get());
+              if (len == 4) {
+                auto size = *reinterpret_cast<int32_t*>(
+                    xcb_get_property_value(reply.get()));
+                incr_data.reserve(size);
+              }
+              incr_data.clear();
             } else {
               std::cerr << "Unsupported selection property type: "
                         << reply->type << std::endl;
@@ -366,6 +377,49 @@ int main(int argc, char** argv) {
           if (e->target == utf8_string.get()) {
             request_queued = true;
             request_type = string_atom.get();
+          }
+        }
+      }
+      continue;
+    } else if (response_type == XCB_PROPERTY_NOTIFY) {
+      auto* e = reinterpret_cast<xcb_property_notify_event_t*>(event.get());
+      if (e->window == incr_requestor && e->atom == incr_property) {
+        if (e->state == XCB_PROPERTY_NEW_VALUE) {
+          auto cookie = xcb_get_property(
+              conn.get(), 1 /* delete */, incr_requestor, incr_property,
+              XCB_GET_PROPERTY_TYPE_ANY,
+              0, std::numeric_limits<uint32_t>::max() / 4);
+          xcb_generic_error_t* err = nullptr;
+          xcb::reply<xcb_get_property_reply_t> reply(
+              xcb_get_property_reply(conn.get(), cookie, &err));
+          if (reply) {
+            auto len = xcb_get_property_value_length(reply.get());
+            if (len == 0) {
+              if (incr_data != current_data) {
+                current_data = incr_data;
+                update_code = true;
+              }
+              incr_data.clear();
+              incr_requestor = XCB_NONE;
+              incr_property = XCB_NONE;
+            } else {
+              if (reply->type == utf8_string.get() ||
+                  reply->type == string_atom.get()) {
+                incr_data.append(reinterpret_cast<char*>(
+                                     xcb_get_property_value(reply.get())),
+                                 len);
+              } else {
+                std::cerr << "Unsupported property notify type: "
+                          << reply->type << std::endl;
+                // Even if we don't understand the type we need to continue
+                // to delete the property or the owner will hang waiting for
+                // us.
+              }
+            }
+          } else {
+            std::cerr << "Error getting property: " <<
+              xcb_event_get_error_label(err->error_code) << std::endl;
+            free(err);
           }
         }
       }
