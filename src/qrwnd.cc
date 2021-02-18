@@ -205,6 +205,7 @@ int main(int argc, char** argv) {
   bool request_queued = true;
   auto request_type = utf8_string.get();
 
+  bool update_code = false;
   std::string current_data;
   std::unique_ptr<cairo_surface_t, CairoSurfaceDeleter> current;
 
@@ -221,6 +222,50 @@ int main(int argc, char** argv) {
                             target_property.get(),
                             XCB_CURRENT_TIME);
       flush = true;
+    }
+
+    if (update_code) {
+      update_code = false;
+      if (everything->is_set() || looks_like_url(current_data)) {
+        auto qrcode = std::unique_ptr<QRcode, QRcodeDeleter>(
+            QRcode_encodeString8bit(
+                current_data.c_str(),
+                0 /* autoselect version */,
+                /* showing on screen so low ec */
+                QR_ECLEVEL_L));
+        if (qrcode) {
+          current.reset(cairo_image_surface_create(
+                            CAIRO_FORMAT_RGB24,
+                            qrcode->width,
+                            qrcode->width));
+          auto stride = cairo_image_surface_get_stride(current.get());
+          cairo_surface_flush(current.get());
+          auto* data = cairo_image_surface_get_data(current.get());
+          if (data) {
+            for (int y = 0; y < qrcode->width; ++y) {
+              auto* out_row = data + y * stride;
+              auto* in_row = qrcode->data + y * qrcode->width;
+              for (int x = 0; x < qrcode->width; ++x) {
+                auto c = (*in_row & 1) ? 0 : 0xff;
+                std::fill_n(out_row, 4, c);
+                ++in_row;
+                out_row += 4;
+              }
+            }
+          }
+          cairo_surface_mark_dirty(current.get());
+        } else {
+          std::cerr << "Failed to generate QR code: "
+                    << strerror(errno) << std::endl;
+          current.reset();
+        }
+      } else {
+        current.reset();
+      }
+
+      invalidate = true;
+      // Force redraw of all
+      invalidate_rect = { 0, 0, wnd_width, wnd_height };
     }
 
     if (invalidate) {
@@ -303,47 +348,7 @@ int main(int argc, char** argv) {
                   xcb_get_property_value_length(reply.get()));
               if (data != current_data) {
                 current_data = data;
-                if (everything->is_set() || looks_like_url(current_data)) {
-                  auto qrcode = std::unique_ptr<QRcode, QRcodeDeleter>(
-                      QRcode_encodeString8bit(
-                          current_data.c_str(),
-                          0 /* autoselect version */,
-                          /* showing on screen so low ec */
-                          QR_ECLEVEL_L));
-                  if (qrcode) {
-                    current.reset(cairo_image_surface_create(
-                                      CAIRO_FORMAT_RGB24,
-                                      qrcode->width,
-                                      qrcode->width));
-                    auto stride =
-                      cairo_image_surface_get_stride(current.get());
-                    cairo_surface_flush(current.get());
-                    auto* data = cairo_image_surface_get_data(current.get());
-                    if (data) {
-                      for (int y = 0; y < qrcode->width; ++y) {
-                        auto* out_row = data + y * stride;
-                        auto* in_row = qrcode->data + y * qrcode->width;
-                        for (int x = 0; x < qrcode->width; ++x) {
-                          auto c = (*in_row & 1) ? 0 : 0xff;
-                          std::fill_n(out_row, 4, c);
-                          ++in_row;
-                          out_row += 4;
-                        }
-                      }
-                    }
-                    cairo_surface_mark_dirty(current.get());
-
-                    invalidate = true;
-                    // Force redraw of all
-                    invalidate_rect = { 0, 0, wnd_width, wnd_height };
-                  } else {
-                    std::cerr << "Failed to generate QR code: "
-                              << strerror(errno) << std::endl;
-                    current.reset();
-                  }
-                } else {
-                  current.reset();
-                }
+                update_code = true;
               }
             } else if (reply->type == incr.get()) {
               // INCR not yet supported
