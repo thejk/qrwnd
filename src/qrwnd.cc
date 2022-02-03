@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cairo-xcb.h>
+#include <chrono>
 #include <errno.h>
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <poll.h>
 #include <qrencode.h>
 #include <string.h>
 #include <xcb/xcb_icccm.h>
@@ -63,6 +65,45 @@ xcb_visualtype_t *find_visual(xcb_screen_t* screen, xcb_visualid_t visual) {
         return visual_iter.data;
   }
   return nullptr;
+}
+
+bool xcb_wait_for_event_timeout(
+    xcb_connection_t* conn,
+    xcb::generic_event& event,
+    std::optional<std::chrono::steady_clock::time_point> timeout) {
+  if (!timeout.has_value()) {
+    event.reset(xcb_wait_for_event(conn));
+    return true;
+  }
+
+  struct pollfd pollfd[1];
+  pollfd[0].fd = xcb_get_file_descriptor(conn);
+  pollfd[0].events = POLLIN | POLLPRI;
+  pollfd[0].revents = 0;
+
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= timeout.value())
+      return false;
+    auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(
+        timeout.value() - now);
+    auto ret = poll(pollfd, 1, dur.count());
+    if (ret == 0) {
+      // Timeout
+      return false;
+    }
+    if (ret == -1) {
+      if (errno == EINTR)
+        continue;
+      // poll() error
+      return true;
+    }
+    event.reset(xcb_poll_for_event(conn));
+    if (event)
+      return true;
+    if (xcb_connection_has_error(conn))
+      return true;
+  }
 }
 
 }  // namespace
@@ -203,6 +244,7 @@ int main(int argc, char** argv) {
   // a bad idea.
   bool request_active = false;
   bool request_queued = true;
+  std::chrono::steady_clock::time_point request_timeout;
   xcb_window_t incr_requestor = XCB_NONE;
   xcb_window_t incr_property = XCB_NONE;
   auto request_type = utf8_string.get();
@@ -220,6 +262,8 @@ int main(int argc, char** argv) {
     if (request_queued && !request_active) {
       request_queued = false;
       request_active = true;
+      request_timeout =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
       xcb_convert_selection(conn.get(), wnd->id(), selection,
                             request_type,
                             target_property.get(),
@@ -319,7 +363,15 @@ int main(int argc, char** argv) {
     if (flush)
       xcb_flush(conn.get());
 
-    xcb::generic_event event(xcb_wait_for_event(conn.get()));
+    xcb::generic_event event;
+    std::optional<std::chrono::steady_clock::time_point> timeout;
+    if (request_active)
+      timeout = request_timeout;
+    if (!xcb_wait_for_event_timeout(conn.get(), event, timeout)) {
+      // Timeout
+      request_active = false;
+      continue;
+    }
     if (!event) {
       auto err = xcb_connection_has_error(conn.get());
       if (err) {
@@ -333,7 +385,6 @@ int main(int argc, char** argv) {
     if (response_type == XCB_SELECTION_NOTIFY) {
       auto* e = reinterpret_cast<xcb_selection_notify_event_t*>(event.get());
       if (e->selection == selection) {
-        assert(request_active);
         request_active = false;
         if (e->property) {
           auto cookie = xcb_get_property(
