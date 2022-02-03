@@ -11,6 +11,7 @@
 #include <cairo-xcb.h>
 #include <chrono>
 #include <errno.h>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -117,6 +118,10 @@ int main(int argc, char** argv) {
       "show QR code for all selection content, not just URLs.");
   auto* display = args->add_option_with_arg(
       'D', "display", "connect to DISPLAY instead of default.", "DISPLAY");
+#ifndef NDEBUG
+  auto* debug = args->add_option_with_arg('D', "debug",
+                                          "write debug info to FILE", "FILE");
+#endif
   std::vector<std::string> arguments;
   if (!args->run(argc, argv, "qrwnd", std::cerr, &arguments)) {
     std::cerr << "Try `qrwnd --help` for usage." << std::endl;
@@ -140,6 +145,12 @@ int main(int argc, char** argv) {
               << "Try `qrwnd --help` for usage." << std::endl;
     return EXIT_FAILURE;
   }
+#ifndef NDEBUG
+  std::ofstream out_dbg(nullptr);
+  if (debug->is_set()) {
+    out_dbg = std::ofstream(debug->arg());
+  }
+#endif
 
   xcb::shared_conn conn;
   int screen_index = 0;
@@ -260,6 +271,12 @@ int main(int argc, char** argv) {
   while (true) {
     bool flush = false;
     if (request_queued && !request_active) {
+#ifndef NDEBUG
+      out_dbg << "Start queued request " << request_type << " "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+        .count() << std::endl;
+#endif
       request_queued = false;
       request_active = true;
       request_timeout =
@@ -272,6 +289,9 @@ int main(int argc, char** argv) {
     }
 
     if (update_code) {
+#ifndef NDEBUG
+      out_dbg << "Update code " << current_data << std::endl;
+#endif
       update_code = false;
       if (everything->is_set() || looks_like_url(current_data)) {
         auto qrcode = std::unique_ptr<QRcode, QRcodeDeleter>(
@@ -369,6 +389,12 @@ int main(int argc, char** argv) {
       timeout = request_timeout;
     if (!xcb_wait_for_event_timeout(conn.get(), event, timeout)) {
       // Timeout
+#ifndef NDEBUG
+      out_dbg << "Timeout waiting for selection notify "
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+        .count() << std::endl;
+#endif
       request_active = false;
       continue;
     }
@@ -385,6 +411,9 @@ int main(int argc, char** argv) {
     if (response_type == XCB_SELECTION_NOTIFY) {
       auto* e = reinterpret_cast<xcb_selection_notify_event_t*>(event.get());
       if (e->selection == selection) {
+#ifndef NDEBUG
+        out_dbg << "Selection Notify" << std::endl;
+#endif
         request_active = false;
         if (e->property) {
           auto cookie = xcb_get_property(
@@ -408,6 +437,10 @@ int main(int argc, char** argv) {
               incr_requestor = e->requestor;
               incr_property = e->property;
               auto len = xcb_get_property_value_length(reply.get());
+#ifndef NDEBUG
+              out_dbg << "INCR " << incr_requestor << " " << incr_property
+                      << " " << len << std::endl;
+#endif
               if (len == 4) {
                 auto size = *reinterpret_cast<int32_t*>(
                     xcb_get_property_value(reply.get()));
@@ -425,6 +458,10 @@ int main(int argc, char** argv) {
           }
         } else {
           // Target format not supported, try with STRING if using UTF8_STRING
+#ifndef NDEBUG
+          out_dbg << "Format not supported (tried " << e->target << ")"
+                  << std::endl;
+#endif
           if (e->target == utf8_string.get()) {
             request_queued = true;
             request_type = string_atom.get();
@@ -434,6 +471,9 @@ int main(int argc, char** argv) {
       continue;
     } else if (response_type == XCB_PROPERTY_NOTIFY) {
       auto* e = reinterpret_cast<xcb_property_notify_event_t*>(event.get());
+#ifndef NDEBUG
+      out_dbg << "Property Notify " << static_cast<int>(e->state) << std::endl;
+#endif
       if (e->window == incr_requestor && e->atom == incr_property) {
         if (e->state == XCB_PROPERTY_NEW_VALUE) {
           auto cookie = xcb_get_property(
@@ -445,6 +485,9 @@ int main(int argc, char** argv) {
               xcb_get_property_reply(conn.get(), cookie, &err));
           if (reply) {
             auto len = xcb_get_property_value_length(reply.get());
+#ifndef NDEBUG
+            out_dbg << "Incr got " << len << std::endl;
+#endif
             if (len == 0) {
               if (incr_data != current_data) {
                 current_data = incr_data;
@@ -480,6 +523,9 @@ int main(int argc, char** argv) {
       auto* e = reinterpret_cast<xcb_xfixes_selection_notify_event_t*>(
           event.get());
       if (e->selection == selection) {
+#ifndef NDEBUG
+        out_dbg << "Xfixes selection notify" << std::endl;
+#endif
         request_queued = true;
         request_type = utf8_string.get();
       }
