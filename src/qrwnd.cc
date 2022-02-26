@@ -214,9 +214,12 @@ int main(int argc, char** argv) {
   // a bad idea.
   bool request_active = false;
   bool request_queued = true;
-  xcb_window_t incr_requestor = XCB_NONE;
-  xcb_window_t incr_property = XCB_NONE;
+  xcb_timestamp_t request_time = XCB_CURRENT_TIME;
+  xcb_atom_t incr_property = XCB_NONE;
   auto request_type = utf8_string.get();
+
+  xcb_window_t property_wnd = XCB_NONE;
+  xcb_atom_t read_property = XCB_NONE;
 
   bool update_code = false;
   std::string current_data;
@@ -230,15 +233,58 @@ int main(int argc, char** argv) {
     bool flush = false;
     if (request_queued && !request_active) {
 #ifndef NDEBUG
-      out_dbg << "Start queued request " << request_type << std::endl;
+      out_dbg << "Start queued request " << request_type << " "
+              << request_time << std::endl;
 #endif
       request_queued = false;
       request_active = true;
       xcb_convert_selection(conn.get(), wnd->id(), selection,
                             request_type,
                             target_property.get(),
-                            XCB_CURRENT_TIME);
+                            request_time);
       flush = true;
+    }
+
+    if (read_property) {
+      auto cookie = xcb_get_property(
+          conn.get(), 1 /* delete */, property_wnd, read_property,
+          XCB_GET_PROPERTY_TYPE_ANY,
+          0, std::numeric_limits<uint32_t>::max() / 4);
+      xcb_generic_error_t* err = nullptr;
+      xcb::reply<xcb_get_property_reply_t> reply(
+          xcb_get_property_reply(conn.get(), cookie, &err));
+      if (reply) {
+        if (reply->type == utf8_string.get() ||
+            reply->type == string_atom.get()) {
+          std::string_view data(
+              reinterpret_cast<char*>(xcb_get_property_value(reply.get())),
+              xcb_get_property_value_length(reply.get()));
+          if (data != current_data) {
+            current_data = data;
+            update_code = true;
+          }
+        } else if (reply->type == incr.get()) {
+          incr_property = read_property;
+          auto len = xcb_get_property_value_length(reply.get());
+#ifndef NDEBUG
+          out_dbg << "INCR " << incr_property << " " << len << std::endl;
+#endif
+          if (len == 4) {
+            auto size = *reinterpret_cast<int32_t*>(
+                xcb_get_property_value(reply.get()));
+            incr_data.reserve(size);
+          }
+          incr_data.clear();
+        } else {
+          std::cerr << "Unsupported selection property type: "
+                    << reply->type << std::endl;
+        }
+      } else {
+        std::cerr << "Error getting property: " <<
+          xcb_event_get_error_label(err->error_code) << std::endl;
+        free(err);
+      }
+      read_property = XCB_NONE;
     }
 
     if (update_code) {
@@ -349,53 +395,18 @@ int main(int argc, char** argv) {
     auto response_type = XCB_EVENT_RESPONSE_TYPE(event.get());
     if (response_type == XCB_SELECTION_NOTIFY) {
       auto* e = reinterpret_cast<xcb_selection_notify_event_t*>(event.get());
-      if (e->selection == selection) {
+      if (e->selection == selection && e->requestor == wnd->id() &&
+          e->time == request_time) {
 #ifndef NDEBUG
-        out_dbg << "Selection Notify" << std::endl;
+        out_dbg << "Selection Notify " << e->time << std::endl;
 #endif
-        assert(request_active);
         request_active = false;
-        if (e->property) {
-          auto cookie = xcb_get_property(
-              conn.get(), 1 /* delete */, e->requestor, e->property,
-              XCB_GET_PROPERTY_TYPE_ANY,
-              0, std::numeric_limits<uint32_t>::max() / 4);
-          xcb_generic_error_t* err = nullptr;
-          xcb::reply<xcb_get_property_reply_t> reply(
-              xcb_get_property_reply(conn.get(), cookie, &err));
-          if (reply) {
-            if (reply->type == utf8_string.get() ||
-                reply->type == string_atom.get()) {
-              std::string_view data(
-                  reinterpret_cast<char*>(xcb_get_property_value(reply.get())),
-                  xcb_get_property_value_length(reply.get()));
-              if (data != current_data) {
-                current_data = data;
-                update_code = true;
-              }
-            } else if (reply->type == incr.get()) {
-              incr_requestor = e->requestor;
-              incr_property = e->property;
-              auto len = xcb_get_property_value_length(reply.get());
-#ifndef NDEBUG
-              out_dbg << "INCR " << incr_requestor << " " << incr_property
-                      << " " << len << std::endl;
-#endif
-              if (len == 4) {
-                auto size = *reinterpret_cast<int32_t*>(
-                    xcb_get_property_value(reply.get()));
-                incr_data.reserve(size);
-              }
-              incr_data.clear();
-            } else {
-              std::cerr << "Unsupported selection property type: "
-                        << reply->type << std::endl;
-            }
-          } else {
-            std::cerr << "Error getting property: " <<
-              xcb_event_get_error_label(err->error_code) << std::endl;
-            free(err);
-          }
+        if (e->property == target_property.get()) {
+          // Already handled by XCB_PROPERTY_NOTIFY
+        } else if (e->property) {
+          assert(!read_property);
+          read_property = e->requestor;
+          property_wnd = e->property;
         } else {
           // Target format not supported, try with STRING if using UTF8_STRING
 #ifndef NDEBUG
@@ -404,6 +415,7 @@ int main(int argc, char** argv) {
 #endif
           if (e->target == utf8_string.get()) {
             request_queued = true;
+            request_time = e->time;
             request_type = string_atom.get();
           }
         }
@@ -412,12 +424,13 @@ int main(int argc, char** argv) {
     } else if (response_type == XCB_PROPERTY_NOTIFY) {
       auto* e = reinterpret_cast<xcb_property_notify_event_t*>(event.get());
 #ifndef NDEBUG
-      out_dbg << "Property Notify " << static_cast<int>(e->state) << std::endl;
+      out_dbg << "Property Notify " << static_cast<int>(e->state)
+              << " " << e->time << std::endl;
 #endif
-      if (e->window == incr_requestor && e->atom == incr_property) {
+      if (e->window == wnd->id() && e->atom == incr_property) {
         if (e->state == XCB_PROPERTY_NEW_VALUE) {
           auto cookie = xcb_get_property(
-              conn.get(), 1 /* delete */, incr_requestor, incr_property,
+              conn.get(), 1 /* delete */, wnd->id(), incr_property,
               XCB_GET_PROPERTY_TYPE_ANY,
               0, std::numeric_limits<uint32_t>::max() / 4);
           xcb_generic_error_t* err = nullptr;
@@ -434,7 +447,6 @@ int main(int argc, char** argv) {
                 update_code = true;
               }
               incr_data.clear();
-              incr_requestor = XCB_NONE;
               incr_property = XCB_NONE;
             } else {
               if (reply->type == utf8_string.get() ||
@@ -456,6 +468,16 @@ int main(int argc, char** argv) {
             free(err);
           }
         }
+      } else if (request_active && e->window == wnd->id() &&
+                 e->atom == target_property.get()) {
+        if (e->state == XCB_PROPERTY_NEW_VALUE) {
+          assert(!read_property);
+          read_property = e->atom;
+          property_wnd = e->window;
+          // Some SelectionOwners will never post a SelectionNotify, so as
+          // soon as we got the property, allow new requests.
+          request_active = false;
+        }
       }
       continue;
     } else if (response_type ==
@@ -467,6 +489,7 @@ int main(int argc, char** argv) {
         out_dbg << "Xfixes selection notify" << std::endl;
 #endif
         request_queued = true;
+        request_time = e->timestamp;
         request_type = utf8_string.get();
       }
       continue;
