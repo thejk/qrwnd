@@ -405,8 +405,8 @@ int main(int argc, char** argv) {
           // Already handled by XCB_PROPERTY_NOTIFY
         } else if (e->property) {
           assert(!read_property);
-          read_property = e->requestor;
-          property_wnd = e->property;
+          read_property = e->property;
+          property_wnd = e->requestor;
         } else {
           // Target format not supported, try with STRING if using UTF8_STRING
 #ifndef NDEBUG
