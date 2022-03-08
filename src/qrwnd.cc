@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cairo-xcb.h>
+#include <chrono>
 #include <errno.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <qrencode.h>
 #include <string.h>
@@ -65,6 +67,14 @@ xcb_visualtype_t *find_visual(xcb_screen_t* screen, xcb_visualid_t visual) {
   }
   return nullptr;
 }
+
+struct Request {
+  std::chrono::steady_clock::time_point expire;
+  bool property_notify;
+
+  explicit Request(std::chrono::steady_clock::time_point expire)
+    : expire(expire), property_notify(false) {}
+};
 
 }  // namespace
 
@@ -130,7 +140,12 @@ int main(int argc, char** argv) {
 
   auto atoms = xcb::Atoms::create(conn);
   auto primary = atoms->get("PRIMARY");
-  auto target_property = atoms->get("QRWND_DATA");
+  std::vector<xcb::Atoms::Reference> target_property;
+  for (int i = 0; i < 10; ++i) {
+    char tmp[15];
+    snprintf(tmp, sizeof(tmp), "QRWND_DATA%d", i);
+    target_property.push_back(atoms->get(tmp));
+  }
   auto utf8_string = atoms->get("UTF8_STRING");
   auto string_atom = atoms->get("STRING");
   auto incr = atoms->get("INCR");
@@ -209,14 +224,11 @@ int main(int argc, char** argv) {
   xcb_map_window(conn.get(), wnd->id());
   // No xcb_flush needed here as request_queued and invalidate will xcb_flush
 
-  // Do not send any new convert selection requests while one is active.
-  // As they all (currently) write to the same property that is just
-  // a bad idea.
-  bool request_active = false;
   bool request_queued = true;
   xcb_timestamp_t request_time = XCB_CURRENT_TIME;
   xcb_atom_t incr_property = XCB_NONE;
   auto request_type = utf8_string.get();
+  std::map<xcb_atom_t, Request> active_request;
 
   xcb_window_t property_wnd = XCB_NONE;
   xcb_atom_t read_property = XCB_NONE;
@@ -231,18 +243,43 @@ int main(int argc, char** argv) {
 
   while (true) {
     bool flush = false;
-    if (request_queued && !request_active) {
+    if (request_queued) {
+      // Remove all expired busy_target_properties
+      auto now = std::chrono::steady_clock::now();
+      auto it = active_request.begin();
+      while (it != active_request.end()) {
+        if (it->second.expire <= now) {
+          if (!it->second.property_notify) {
 #ifndef NDEBUG
-      out_dbg << "Start queued request " << request_type << " "
-              << request_time << std::endl;
+            out_dbg << "Old request timed out" << std::endl;
 #endif
-      request_queued = false;
-      request_active = true;
-      xcb_convert_selection(conn.get(), wnd->id(), selection,
-                            request_type,
-                            target_property.get(),
-                            request_time);
-      flush = true;
+          }
+          it = active_request.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (active_request.size() < target_property.size()) {
+#ifndef NDEBUG
+        out_dbg << "Start queued request " << request_type << " "
+                << request_time << std::endl;
+#endif
+        request_queued = false;
+        auto expire = now + std::chrono::seconds(10);
+        xcb_atom_t target;
+        for (auto& property : target_property) {
+          target = property.get();
+          if (active_request.emplace(target, expire).second)
+            break;
+        }
+        xcb_convert_selection(conn.get(), wnd->id(), selection,
+                              request_type, target, request_time);
+        flush = true;
+      } else {
+#ifndef NDEBUG
+        out_dbg << "All properties are already waiting" << std::endl;
+#endif
+      }
     }
 
     if (read_property) {
@@ -400,9 +437,16 @@ int main(int argc, char** argv) {
 #ifndef NDEBUG
         out_dbg << "Selection Notify " << e->time << std::endl;
 #endif
-        request_active = false;
-        if (e->property == target_property.get()) {
-          // Already handled by XCB_PROPERTY_NOTIFY
+        auto it = active_request.find(e->property);
+        if (it != active_request.end()) {
+          if (it->second.property_notify) {
+            // Already handled by XCB_PROPERTY_NOTIFY
+          } else {
+            assert(!read_property);
+            read_property = e->property;
+            property_wnd = e->requestor;
+          }
+          active_request.erase(it);
         } else if (e->property) {
           assert(!read_property);
           read_property = e->property;
@@ -468,15 +512,15 @@ int main(int argc, char** argv) {
             free(err);
           }
         }
-      } else if (request_active && e->window == wnd->id() &&
-                 e->atom == target_property.get()) {
-        if (e->state == XCB_PROPERTY_NEW_VALUE) {
+      } else if (e->window == wnd->id() && e->state == XCB_PROPERTY_NEW_VALUE) {
+        auto it = active_request.find(e->atom);
+        if (it != active_request.end()) {
+          // Some clients never reply with a SelectionNotify but they do
+          // update the property. So read it as soon as it changes.
           assert(!read_property);
           read_property = e->atom;
           property_wnd = e->window;
-          // Some SelectionOwners will never post a SelectionNotify, so as
-          // soon as we got the property, allow new requests.
-          request_active = false;
+          it->second.property_notify = true;
         }
       }
       continue;
